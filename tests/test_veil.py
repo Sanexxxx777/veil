@@ -86,6 +86,17 @@ for near in (rs(63, "0123456789abcdef"), rs(65, "0123456789abcdef"), rs(40, "012
 url_pw = rs(14)
 masked, counts = veil.mask_text(f"DSN postgres://bob:{url_pw}@db:5432/app\n", st)
 check("url password masked, user kept", url_pw not in masked and "bob:{{PASSWORD_" in masked, masked)
+fresh_pw, fresh_hex = rs(14), rs(64, "0123456789abcdef")  # not in any map yet
+masked, _ = veil.mask_text(f"REDIS_URL=redis://:{fresh_pw}@10.0.0.5:6379/0\n", veil.Store(home("fresh")))
+check("url password with an empty user", fresh_pw not in masked and "://:{{PASSWORD_" in masked, masked)
+masked, _ = veil.mask_text(f"key 0X{fresh_hex} end\n", veil.Store(home("fresh")))
+check("0X prefix: hex still masked", masked.startswith("key 0X{{HEX_KEY_"), masked)
+cut_pem = "boot\n" + FAKES["pem"][1].split("-----END")[0][:150]  # a log window that ends mid-key
+masked, counts = veil.mask_text(cut_pem, st)
+check("a key block cut off before END is masked to the end", masked.startswith("boot\n{{PRIVATE_KEY_") and masked.endswith("}}")
+      and counts == {"PRIVATE_KEY": 1}, masked)
+masked, _ = veil.mask_text(f"users:\n  - password: two words {url_pw}\n", st)
+check("YAML list item: the whole value", "two words" not in masked and url_pw not in masked, masked)
 bearer = rs(40, ALNUM + "._-")
 masked, counts = veil.mask_text(f"Authorization: Bearer {bearer}\n", st)
 check("Authorization header: TOKEN, scheme kept", bearer not in masked and "Bearer {{TOKEN_" in masked
@@ -95,7 +106,7 @@ masked, counts = veil.mask_text(f"OPENAI_API_KEY={sk}\n", st)
 check("NAME=<known format>: the format's kind wins", counts == {"API_KEY": 1}, str(counts))
 
 # ---- secret names ------------------------------------------------------------------
-P = [rs(18, ALNUM + "!%^") for _ in range(14)]
+P = ["Q" + rs(16, ALNUM + "!%^") + "7" for _ in range(14)]  # a letter and a digit, always
 POSITIVE = [
     (f"DB_PASSWORD={P[0]}\n", P[0]),
     (f'export API_KEY="{P[1]}"\n', P[1]),
@@ -272,6 +283,14 @@ short.mkdir()
 (short / "key").write_bytes(b"x" * 5)
 rc, _, err = cli(["mask"], b"API_TOKEN=" + rs(20).encode() + b"\n", short)
 check("short key file: exit 2", rc == 2 and b"32-byte" in err, err.decode())
+empty = home("emptykey")
+empty.mkdir()
+(empty / "key").write_bytes(b"")  # left by a crash between create and write
+rc, _, err = cli(["mask"], b"API_TOKEN=" + rs(20).encode() + b"\n", empty)
+check("empty key file is replaced", rc == 0 and len((empty / "key").read_bytes()) == 32, err.decode())
+pipe = subprocess.run(f'"{sys.executable}" "{ROOT / "veil.py"}" unmask --home "{h}" | head -c 10',
+                      shell=True, input=b"x" * 2_000_000, capture_output=True)
+check("a reader that leaves early: no traceback", pipe.stderr == b"", pipe.stderr.decode()[-200:])
 
 # two masks at once must not lose each other's values
 par = home("parallel")

@@ -29,7 +29,7 @@ from pathlib import Path
 # is masked: the 0x of a hex key and the user of a URL stay readable.
 FORMATS = [
     ("PRIVATE_KEY", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]+?"
-                    r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
+                    r"(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|\Z)"),  # cut off: to the end
     ("API_KEY", r"(?<![\w-])sk-(?:ant-|proj-|or-|svcacct-|admin-)?[\w-]{20,}"),
     ("API_KEY", r"(?<![\w-])(?:(?:sk|rk)_live_[0-9A-Za-z]{20,}|AIza[\w-]{35}|hf_[A-Za-z0-9]{30,}"
                 r"|gsk_[A-Za-z0-9]{40,}|xai-[A-Za-z0-9]{40,}|npm_[A-Za-z0-9]{36}|pypi-[\w-]{50,}"
@@ -39,8 +39,8 @@ FORMATS = [
     ("AWS_KEY_ID", r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
     ("JWT", r"(?<![\w-])eyJ[\w-]{8,}\.eyJ[\w-]{8,}\.[\w-]{8,}"),
     ("BOT_TOKEN", r"(?<![0-9])[0-9]{8,12}:[\w-]{35}(?![\w-])"),
-    ("HEX_KEY", r"(?<!\w)(?:0x)?([0-9a-fA-F]{64})(?!\w)"),
-    ("PASSWORD", r"[A-Za-z][A-Za-z0-9+.-]*://[^\s:@/?#\"'<>]+:([^\s@/?#\"'<>]{3,})@"),
+    ("HEX_KEY", r"(?<!\w)(?:0[xX])?([0-9a-fA-F]{64})(?!\w)"),
+    ("PASSWORD", r"[A-Za-z][A-Za-z0-9+.-]*://[^\s:@/?#\"'<>]*:([^\s@/?#\"'<>]{3,})@"),
     ("TOKEN", r"\b(?:Bearer|Basic)[ \t]+([\w.~+/=-]{16,})"),
 ]
 FORMAT_RES = [(kind, re.compile(p, re.A)) for kind, p in FORMATS]
@@ -64,7 +64,7 @@ ABOUT_SUFFIXES = ("_type", "_name", "_path", "_file", "_dir", "_id", "_len", "_l
 # NAME = value, NAME: value, "name": "value", export NAME=..., but not == or :=
 ASSIGN_RE = re.compile(r"""(?<![\w.])([A-Za-z_][\w.-]*)(\\?["'])?[ \t]*(?<![=!<>])([:=])(?!=)[ \t]*""", re.A)
 FLAG_RE = re.compile(r"(?<![\w-])--([A-Za-z][\w-]*)[ \t]+(?![-\s])", re.A)  # --token value
-LINE_PREFIX = re.compile(r"[ \t]*(?:export[ \t]+)?")
+LINE_PREFIX = re.compile(r"[ \t]*(?:export[ \t]+|-[ \t]+)?")  # also a YAML list item
 QUOTED = [re.compile(r'\\"(.*?)\\"'), re.compile(r'"((?:[^"\\\n]|\\.)*)"'),
           re.compile(r"'([^'\n]*)'"), re.compile(r"`([^`\n]*)`")]
 OPEN_QUOTE = re.compile(r"""(?:\\?["'`])?""")
@@ -90,7 +90,6 @@ HOLD_MAX = 96  # longer than any placeholder with its braces and spaces
 LEFT_BRACES = re.compile(r"\{{0,2}[ \t]{0,2}\Z")
 RIGHT_BRACES = re.compile(r"[ \t]{0,2}\}{0,2}")
 WORD_PAIR = re.compile(r"\w\w", re.A)
-SECRETISH_MIN = 8
 
 
 class VeilError(Exception):
@@ -127,12 +126,13 @@ class Store:
     def key(self) -> bytes:
         if not self._key:
             path = self.home / "key"
-            if not path.exists():
+            if not path.exists() or path.stat().st_size == 0:  # an empty key was never used
                 self.home.mkdir(mode=0o700, parents=True, exist_ok=True)
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as f:
+                tmp = path.with_name("key.tmp")
+                with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
                     f.write(secrets.token_bytes(32))
                     os.fsync(f.fileno())
+                os.replace(tmp, path)
             _tighten(path, 0o600)
             self._key = path.read_bytes()
             if len(self._key) != 32:
@@ -200,14 +200,14 @@ def _plausible(v: str, min_len: int = 6) -> bool:
 
 
 def _secretish(v: str) -> bool:
-    return len(v) >= SECRETISH_MIN and re.search(r"\d", v) is not None and re.search(r"[A-Za-z]", v) is not None
+    return len(v) >= 8 and re.search(r"\d", v) is not None and re.search(r"[A-Za-z]", v) is not None
 
 
 def _spreads(v: str) -> bool:
     """A value random enough to mask wherever it shows up again: three of lower, upper,
     digit, symbol, or 16+ chars of letters and digits. Not hide_cookie2 or PasswordMgr."""
     classes = sum(re.search(c, v) is not None for c in (r"[a-z]", r"[A-Z]", r"\d", r"[^\w.-]"))
-    return len(v) >= SECRETISH_MIN and (classes >= 3 or (len(v) >= 16 and _secretish(v)))
+    return len(v) >= 8 and (classes >= 3 or (len(v) >= 16 and _secretish(v)))
 
 
 def _value_at(s: str, i: int, rest_of_line: bool):
@@ -244,18 +244,18 @@ def _pick(spans):
 
 def mask_text(text: str, store: Store):
     """Return (masked text, {kind: replacements}). New values go into store; call store.save()."""
-    taken = [m.span() for m in PLACEHOLDER_RE.finditer(text)]
+    taken = {i for m in PLACEHOLDER_RE.finditer(text) for i in range(*m.span())}
 
     def free(a, b):
-        return b > a and not any(a < z and b > y for y, z in taken)
+        return b > a and taken.isdisjoint(range(a, b))
 
     found = [(*m.span(1 if rx.groups else 0), kind, rank)  # (start, end, kind, rank)
              for rank, (kind, rx) in enumerate(FORMAT_RES) for m in rx.finditer(text)]
     found = [f for f in found if f[2] != "PASSWORD" or _plausible(text[f[0]:f[1]], 3)]
-    formats = list(found)
+    formats = {(y, z) for y, z, _, _ in found}
 
     def format_covers(a, b):  # pk=0x<hex>: the hex rule's span, not 0x+hex as a SECRET
-        return any(y >= a and z <= b and (b - a) - (z - y) <= 2 for y, z, _, _ in formats)
+        return any((y, z) in formats for y in range(a, a + 3) for z in range(b - 2 + y - a, b + 1))
 
     for rx in (ASSIGN_RE, FLAG_RE):
         for m in rx.finditer(text):
@@ -272,7 +272,7 @@ def mask_text(text: str, store: Store):
     picked = _pick(sp for sp in found if free(sp[0], sp[1]))
     for a, b, kind, _ in picked:
         store.placeholder(kind, text[a:b])
-    known = sorted((v for v in store.by_value if _spreads(v)), key=len, reverse=True)
+    known = sorted((v for v in store.by_value if _spreads(v) and v in text), key=len, reverse=True)
     if known:
         known_re = re.compile("|".join(map(re.escape, known)))
         picked = _pick(picked + [(*m.span(), "", 200) for m in known_re.finditer(text)
@@ -388,6 +388,8 @@ def main(argv=None) -> int:
         else:
             values = Store(args.home).values if args.home.exists() else {}
             unmask_stream(lambda: os.read(sys.stdin.fileno(), 65536), sys.stdout.buffer, values)
+    except BrokenPipeError:  # the reader left (veil unmask | head); quiet, like cat
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     except (VeilError, OSError) as e:
         _warn(str(e))
         return 2
