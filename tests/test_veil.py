@@ -95,6 +95,30 @@ cut_pem = "boot\n" + FAKES["pem"][1].split("-----END")[0][:150]  # a log window 
 masked, counts = veil.mask_text(cut_pem, st)
 check("a key block cut off before END is masked to the end", masked.startswith("boot\n{{PRIVATE_KEY_") and masked.endswith("}}")
       and counts == {"PRIVATE_KEY": 1}, masked)
+cst = veil.Store(home("cut"))  # a home that has not seen the key: no known value masks it
+old = cst.placeholder("API_KEY", FAKES["sk_proj"][1])  # written by an earlier mask
+text = cut_pem + "\n" + old + " retry\n"
+masked, counts = veil.mask_text(text, cst)
+check("a cut key stops at a placeholder already there", masked.startswith("boot\n{{PRIVATE_KEY_")
+      and masked.endswith("}}\n" + old + " retry\n") and counts == {"PRIVATE_KEY": 1}
+      and veil.unmask_text(masked, cst.values) == text.replace(old, FAKES["sk_proj"][1]), masked)
+cert = "-----BEGIN CERTIFICATE-----\n" + rs(64, ALNUM + "+/") + "\n-----END CERTIFICATE-----\n"
+masked, counts = veil.mask_text(cut_pem + "\n" + cert, cst)
+check("a cut key stops at the next BEGIN, the certificate stays", masked.startswith("boot\n{{PRIVATE_KEY_")
+      and masked.endswith("}}\n" + cert) and counts == {"PRIVATE_KEY": 1}, masked)
+pub = rs(64, ALNUM + "+/") + "\n-----END PUBLIC KEY-----\n"
+text = ("12:00:01 worker up\n" + pem_body.split("\n", 1)[1] + "\n-----END RSA " + "PRIVATE KEY-----\n"
+        + "12:00:02 ready\n" + pub)  # tail -n cut the BEGIN line and the first body line off
+masked, counts = veil.mask_text(text, cst)
+check("a key cut at the top: its lines and END masked, the lines around and a public key stay",
+      masked.startswith("12:00:01 worker up\n{{PRIVATE_KEY_") and masked.endswith("}}\n12:00:02 ready\n" + pub)
+      and counts == {"PRIVATE_KEY": 1} and veil.unmask_text(masked, cst.values) == text, masked)
+text = ("log a\r\n\r\nDEK-Info: AES-128-CBC," + rs(16, "0123456789ABCDEF") + "\r\n\r\n"
+        + pem_body.replace("\n", "\r\n") + "\r\n-----END RSA " + "PRIVATE KEY-----\r\nlog b\r\n")
+masked, counts = veil.mask_text(text, cst)
+check("a key cut inside its headers: header, blank line, body and END go together (CRLF)",
+      masked.startswith("log a\r\n\r\n{{PRIVATE_KEY_") and masked.endswith("}}\r\nlog b\r\n")
+      and counts == {"PRIVATE_KEY": 1}, masked)
 masked, _ = veil.mask_text(f"users:\n  - password: two words {url_pw}\n", st)
 check("YAML list item: the whole value", "two words" not in masked and url_pw not in masked, masked)
 bearer = rs(40, ALNUM + "._-")

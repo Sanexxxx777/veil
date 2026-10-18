@@ -25,11 +25,17 @@ import secrets
 import sys
 from pathlib import Path
 
+PLACEHOLDER = r"\{\{[A-Z][A-Z0-9_]*_[0-9a-f]{8,64}\}\}"
+PEM_LABEL = r"(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
+
 # Token formats as (kind, pattern). Where a pattern has a group, only the group
 # is masked: the 0x of a hex key and the user of a URL stay readable.
 FORMATS = [
-    ("PRIVATE_KEY", r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]+?"
-                    r"(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|\Z)"),  # cut off: to the end
+    # A block cut off before its END line runs to the end of the text, short of trailing
+    # whitespace, the next BEGIN or a placeholder already there: a span over a
+    # placeholder would be dropped and the key left readable.
+    ("PRIVATE_KEY", r"-----BEGIN " + PEM_LABEL + r"[\s\S]+?(?:-----END " + PEM_LABEL
+                    + r"|(?=\s*(?:\Z|-----BEGIN |" + PLACEHOLDER + r")))"),
     ("API_KEY", r"(?<![\w-])sk-(?:ant-|proj-|or-|svcacct-|admin-)?[\w-]{20,}"),
     ("API_KEY", r"(?<![\w-])(?:(?:sk|rk)_live_[0-9A-Za-z]{20,}|AIza[\w-]{35}|hf_[A-Za-z0-9]{30,}"
                 r"|gsk_[A-Za-z0-9]{40,}|xai-[A-Za-z0-9]{40,}|npm_[A-Za-z0-9]{36}|pypi-[\w-]{50,}"
@@ -44,6 +50,12 @@ FORMATS = [
     ("TOKEN", r"\b(?:Bearer|Basic)[ \t]+([\w.~+/=-]{16,})"),
 ]
 FORMAT_RES = [(kind, re.compile(p, re.A)) for kind, p in FORMATS]
+PEM_END_RE = re.compile(r"-----END " + PEM_LABEL, re.A)
+# A line that may stand between a key's END line and the top of a log window that cut
+# its BEGIN off (tail -n): base64, a PGP checksum, a PEM or armor header, or blank.
+PEM_LINE_RE = re.compile(r"[ \t]*(?:[A-Za-z0-9+/]+={0,2}|=[A-Za-z0-9+/]{4}"
+                         r"|(?:Proc-Type|DEK-Info|Version|Comment|Hash|Charset|MessageID): [^\n]*)?"
+                         r"[ \t\r]*", re.A)
 
 # A name holds a secret when, in snake case (apiKey and api-key read as api_key),
 # it contains one of STRONG_WORDS or WEAK_WORDS, or is or ends in _ + one of the
@@ -81,7 +93,7 @@ REFERENCE = re.compile(r"[$%{<\[(*]|(?:self|this|os|process|env|config|cfg|setti
 NUMBER = re.compile(r"[+-]?\d[\d.,_:/TZ+-]*")  # 4096, 0.25, 1,000, 2026-10-14T12:00:00Z
 DOTTED = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", re.A)  # http.cookies, api.example.com
 
-PLACEHOLDER_RE = re.compile(r"\{\{[A-Z][A-Z0-9_]*_[0-9a-f]{8,64}\}\}")
+PLACEHOLDER_RE = re.compile(PLACEHOLDER)
 # A placeholder's body as a model may write it back: case changed, braces dropped.
 BODY_RE = re.compile(r"(?<!\w)[A-Za-z]\w*_[0-9a-fA-F]{8,64}(?!\w)", re.A)
 # What the end of a stream chunk may be if a placeholder is still arriving.
@@ -242,6 +254,25 @@ def _pick(spans):
     return out
 
 
+def _top_cut_keys(text: str):
+    """Spans of private keys whose top a log window cut off (tail -n): the key lines
+    right above an END line, from the first one that is not blank to the end of END.
+    The lines above them stay readable."""
+    for m in PEM_END_RE.finditer(text):
+        a = text.rfind("\n", 0, m.start()) + 1
+        if text[a:m.start()].strip(" \t"):
+            continue  # END is not alone on its line
+        top = a
+        while top:  # up one line at a time while the line is a key line
+            b = text.rfind("\n", 0, top - 1) + 1
+            if not PEM_LINE_RE.fullmatch(text, b, top - 1):
+                break
+            top = b
+        top = a - len(text[top:a].lstrip())  # blank lines and the indent on top stay
+        if top < a:  # one line of the key at least; under a BEGIN the whole block wins in _pick
+            yield top, m.end()
+
+
 def mask_text(text: str, store: Store):
     """Return (masked text, {kind: replacements}). New values go into store; call store.save()."""
     taken = {i for m in PLACEHOLDER_RE.finditer(text) for i in range(*m.span())}
@@ -251,6 +282,7 @@ def mask_text(text: str, store: Store):
 
     found = [(*m.span(1 if rx.groups else 0), kind, rank)  # (start, end, kind, rank)
              for rank, (kind, rx) in enumerate(FORMAT_RES) for m in rx.finditer(text)]
+    found += [(a, b, "PRIVATE_KEY", 0) for a, b in _top_cut_keys(text)]
     found = [f for f in found if f[2] != "PASSWORD" or _plausible(text[f[0]:f[1]], 3)]
     formats = {(y, z) for y, z, _, _ in found}
 

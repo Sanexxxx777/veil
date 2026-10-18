@@ -51,7 +51,7 @@ Python 3.9+ on macOS or Linux, standard library only, one file. Copy `veil.py` o
 
 | kind | what |
 |---|---|
-| `PRIVATE_KEY` | PEM private key blocks: RSA, EC, OpenSSH, encrypted, PGP; a block cut off before its END line is masked to the end of the text |
+| `PRIVATE_KEY` | PEM private key blocks: RSA, EC, OpenSSH, encrypted, PGP. A block cut off before its END line is masked to the end of the text, or up to the next `-----BEGIN` or a placeholder already there. A block whose top was cut off (`tail -n 200`) is masked from the first of its lines left (base64, or a header like `DEK-Info:`) through END; the lines above stay. Public keys and certificates are not masked |
 | `API_KEY` | `sk-…` (OpenAI, Anthropic, DeepSeek, OpenRouter), Google `AIza…`, Groq `gsk_…`, Stripe `sk_live_…`, Hugging Face, xAI, npm, PyPI, DigitalOcean, SendGrid |
 | `GIT_TOKEN` | GitHub `ghp_…`, `gho_…`, `github_pat_…`; GitLab `glpat-…` |
 | `SLACK_TOKEN`, `AWS_KEY_ID`, `JWT` | `xox…`; `AKIA…`, `ASIA…`; `eyJ….eyJ….…` |
@@ -105,6 +105,9 @@ I have not measured it on a corpus of real logs. The tests use synthetic secrets
   digits only is left alone, a PIN included.
 - **A value with spaces in the middle of a line.** In `retry password=correct horse battery`
   only `correct` is masked.
+- **A key cut at the top in a log that prefixes every line.** journald and `docker logs -t` put
+  a timestamp before each line of the key. Without its BEGIN line, only lines that hold nothing
+  but the key count as the key, so such a key passes through.
 - **Personal data.** Emails, phone numbers and names pass through. magpie has rules for those,
   this tool does not.
 - **A placeholder the model rewrites beyond the forms above.** If it cuts one short or renames
@@ -114,6 +117,8 @@ What it costs:
 
 - **Every 64-digit hex string gets masked,** transaction hashes and checksums included. The same
   hash still gets the same placeholder, so the model can follow it through a log.
+- **A one-word line right above a key cut at the top goes with it.** A word like `ready` is
+  made of the same letters as a line of base64, so it ends up in the key's placeholder.
 - **The map keeps every masked value in plain text** (mode 600). Whoever can read your home
   directory can read it, the same as your `.env`. Delete `map.json` once a conversation is over;
   the key can stay.
@@ -146,15 +151,16 @@ print(um.flush())
 python3 tests/test_veil.py
 ```
 
-145 checks: each token format on a synthetic value, the name rule on 16 lines it must mask and
-21 it must leave alone (from `max_tokens=4096` to `sorted(key=lambda …)`), the same placeholder
-across runs and a different one under another key, a forced hash collision, an exact round trip
-through the CLI with CRLF and invalid UTF-8, the forms of a mangled placeholder, a streamed reply
-cut at every position and at 300 random sets of positions, file modes, a corrupt map, and eight
-masks running at once. Every token-shaped secret is assembled at run time from a seeded
-generator, and gitleaks finds nothing in the file. To check that the tests catch what they claim
-to, I broke the code in 24 places, one at a time (no stream hold-back, no file lock, no
-collision handling and so on), and each break failed at least one check.
+149 checks: each token format on a synthetic value, private keys cut off at the end and at the
+top, the name rule on 16 lines it must mask and 21 it must leave alone (from `max_tokens=4096`
+to `sorted(key=lambda …)`), the same placeholder across runs and a different one under another
+key, a forced hash collision, an exact round trip through the CLI with CRLF and invalid UTF-8,
+the forms of a mangled placeholder, a streamed reply cut at every position and at 300 random
+sets of positions, file modes, a corrupt map, and eight masks running at once. Every
+token-shaped secret is assembled at run time from a seeded generator, and gitleaks finds nothing
+in the file. To check that the tests catch what they claim to, I broke the code in 24 places,
+one at a time (no stream hold-back, no file lock, no collision handling and so on), and each
+break failed at least one check. The cut-key rules got eight more such breaks, all caught.
 
 ## Where it came from
 
