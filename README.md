@@ -44,6 +44,10 @@ Python 3.9+ on macOS or Linux, standard library only, one file. Copy `veil.py` o
   stays as it is.
 - `unmask` writes its input out as it arrives and holds back only a tail that could still turn
   into a placeholder, about one word.
+- Text that already holds placeholders, a masked log with new lines added or an answer pasted
+  back, is masked around them. In `password: Zq81 horse {{API_KEY_276082b2}}` or
+  `"token": "{{API_KEY_276082b2}}-Zq81xk"` the value is judged as it read before the earlier
+  mask, and the text on either side of the placeholder is masked; the placeholder stays.
 - `mask` and then `unmask` give back the input byte for byte, CRLF line ends and invalid UTF-8
   included.
 
@@ -102,7 +106,8 @@ I have not measured it on a corpus of real logs. The tests use synthetic secrets
   `mnemonic` field, a base64 blob under a neutral name, keys from a provider that gives them no
   prefix.
 - **Short and numeric values.** Under a name, a value shorter than 6 characters or made of
-  digits only is left alone, a PIN included.
+  digits only is left alone, a PIN included. Next to a placeholder already in the text, a part
+  of one or two characters stays.
 - **A value with spaces in the middle of a line.** In `retry password=correct horse battery`
   only `correct` is masked.
 - **A key cut at the top in a log that prefixes every line.** journald and `docker logs -t` put
@@ -151,8 +156,9 @@ print(um.flush())
 python3 tests/test_veil.py
 ```
 
-149 checks: each token format on a synthetic value, private keys cut off at the end and at the
-top, the name rule on 16 lines it must mask and 21 it must leave alone (from `max_tokens=4096`
+158 checks: each token format on a synthetic value, private keys cut off at the end and at the
+top, secrets next to a placeholder an earlier mask left (and a mask of that text again), the
+name rule on 16 lines it must mask and 21 it must leave alone (from `max_tokens=4096`
 to `sorted(key=lambda …)`), the same placeholder across runs and a different one under another
 key, a forced hash collision, an exact round trip through the CLI with CRLF and invalid UTF-8,
 the forms of a mangled placeholder, a streamed reply cut at every position and at 300 random
@@ -160,7 +166,8 @@ sets of positions, file modes, a corrupt map, and eight masks running at once. E
 token-shaped secret is assembled at run time from a seeded generator, and gitleaks finds nothing
 in the file. To check that the tests catch what they claim to, I broke the code in 24 places,
 one at a time (no stream hold-back, no file lock, no collision handling and so on), and each
-break failed at least one check. The cut-key rules got eight more such breaks, all caught.
+break failed at least one check. The cut-key rules got eight more such breaks and the masking
+around placeholders eleven, all caught.
 
 ## Where it came from
 

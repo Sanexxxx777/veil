@@ -13,6 +13,7 @@ ported from yetone/magpie internal/redact/redact.go (MIT, see NOTICE).
 from __future__ import annotations
 
 import argparse
+import bisect
 import codecs
 import contextlib
 import fcntl
@@ -32,8 +33,7 @@ PEM_LABEL = r"(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
 # is masked: the 0x of a hex key and the user of a URL stay readable.
 FORMATS = [
     # A block cut off before its END line runs to the end of the text, short of trailing
-    # whitespace, the next BEGIN or a placeholder already there: a span over a
-    # placeholder would be dropped and the key left readable.
+    # whitespace, the next BEGIN or a placeholder already there, after which the log goes on.
     ("PRIVATE_KEY", r"-----BEGIN " + PEM_LABEL + r"[\s\S]+?(?:-----END " + PEM_LABEL
                     + r"|(?=\s*(?:\Z|-----BEGIN |" + PLACEHOLDER + r")))"),
     ("API_KEY", r"(?<![\w-])sk-(?:ant-|proj-|or-|svcacct-|admin-)?[\w-]{20,}"),
@@ -275,33 +275,84 @@ def _top_cut_keys(text: str):
 
 def mask_text(text: str, store: Store):
     """Return (masked text, {kind: replacements}). New values go into store; call store.save()."""
-    taken = {i for m in PLACEHOLDER_RE.finditer(text) for i in range(*m.span())}
+    held = [m.span() for m in PLACEHOLDER_RE.finditer(text)]
+
+    def within(a, b):  # the placeholders already there that overlap text[a:b]
+        i = bisect.bisect_left(held, (a, a))
+        return [(x, y) for x, y in held[max(i - 1, 0):bisect.bisect_left(held, (b, b))] if y > a]
 
     def free(a, b):
-        return b > a and taken.isdisjoint(range(a, b))
+        return b > a and not within(a, b)
+
+    def body(ph):  # API_KEY_3f9a12bc: a placeholder read as a word, not as a {template}
+        return ph.group()[2:-2]
+
+    def around(a, b, ok=lambda v: True, whole=None):
+        """[(a, b)] if ok(text[a:b]). A span over placeholders already there used to be
+        dropped, and the rest of the secret stayed readable. Now ok() judges the whole (by
+        default each placeholder read as its body), and its parts around the placeholders go,
+        without their blank ends, if 3 characters or more with a letter or digit: the 0x of
+        pk=0x<hex> and the punctuation between two placeholders stay."""
+        inside = within(a, b)
+        if not inside:
+            return [(a, b)] if b > a and ok(text[a:b]) else []
+        if not ok(PLACEHOLDER_RE.sub(body, text[a:b]) if whole is None else whole):
+            return []
+        ends = [a, *(c for span in inside for c in span), b]
+        out = []
+        for p, q in zip(ends[::2], ends[1::2]):  # the text before, between and after them
+            v = text[p:q]
+            p, q = p + len(v) - len(v.lstrip()), q - len(v) + len(v.rstrip())
+            if q - p >= 3 and any(map(str.isalnum, text[p:q])):
+                out.append((p, q))
+        return out
 
     found = [(*m.span(1 if rx.groups else 0), kind, rank)  # (start, end, kind, rank)
              for rank, (kind, rx) in enumerate(FORMAT_RES) for m in rx.finditer(text)]
     found += [(a, b, "PRIVATE_KEY", 0) for a, b in _top_cut_keys(text)]
-    found = [f for f in found if f[2] != "PASSWORD" or _plausible(text[f[0]:f[1]], 3)]
+    found = [(*s, kind, rank) for a, b, kind, rank in found
+             for s in (around(a, b, lambda v: _plausible(v, 3)) if kind == "PASSWORD" else around(a, b))]
     formats = {(y, z) for y, z, _, _ in found}
 
     def format_covers(a, b):  # pk=0x<hex>: the hex rule's span, not 0x+hex as a SECRET
         return any((y, z) in formats for y in range(a, a + 3) for z in range(b - 2 + y - a, b + 1))
 
+    # The name rule reads the text as it was before it was masked, each placeholder this
+    # store knows written back as its value: a value masked in part keeps where it ends and
+    # whether it counts, so a mask of masked text masks nothing new. Another placeholder
+    # stays, its body would read as a name (API_KEY_3f9a12bc: ...). back() maps to text.
+    starts, pieces, parts, n, p = [], [], [], 0, 0
+    for x, y in held + [(len(text), len(text))]:
+        for s, t, raw in ((p, x, True), (x, y, False)):
+            parts.append(text[s:t] if raw else store.values.get(text[s:t], text[s:t]))
+            starts.append(n)
+            pieces.append((s, t, raw))
+            n += len(parts[-1])
+        p = y
+    view = "".join(parts)
+
+    def back(i, end=False):  # inside a placeholder: where it starts, or for an end where it ends
+        k = bisect.bisect_right(starts, i - 1 if end else i) - 1
+        s, t, raw = pieces[k]
+        return s + i - starts[k] if raw else (t if end else s)
+
     for rx in (ASSIGN_RE, FLAG_RE):
-        for m in rx.finditer(text):
+        for m in rx.finditer(view):
             strength = _name_strength(m.group(1))
             if not strength:
                 continue
-            line_start = text.rfind("\n", 0, m.start()) + 1
-            rest = rx is ASSIGN_RE and m.group(3) == ":" and LINE_PREFIX.fullmatch(text, line_start, m.start())
-            span = _value_at(text, m.end(), bool(rest))
-            v = text[span[0]:span[1]] if span else ""
-            if span and _plausible(v) and (strength == 2 or _secretish(v)) and not format_covers(*span):
-                found.append((*span, "SECRET", 100))
+            line_start = view.rfind("\n", 0, m.start()) + 1
+            rest = rx is ASSIGN_RE and m.group(3) == ":" and LINE_PREFIX.fullmatch(view, line_start, m.start())
+            span = _value_at(view, m.end(), bool(rest))
+            if not span:
+                continue
+            a, b = back(span[0]), back(span[1], True)
+            if not format_covers(a, b):
+                found += [(*s, "SECRET", 100) for s in around(
+                    a, b, lambda v, s=strength: _plausible(v) and (s == 2 or _secretish(v)),
+                    PLACEHOLDER_RE.sub(body, view[span[0]:span[1]]))]
 
-    picked = _pick(sp for sp in found if free(sp[0], sp[1]))
+    picked = _pick(found)
     for a, b, kind, _ in picked:
         store.placeholder(kind, text[a:b])
     known = sorted((v for v in store.by_value if _spreads(v) and v in text), key=len, reverse=True)

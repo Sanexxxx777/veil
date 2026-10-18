@@ -174,6 +174,42 @@ for text in NEGATIVE:
     masked, counts = veil.mask_text(text, veil.Store(home("names")))
     check(f"left alone: {text.strip()}", masked == text and not counts, masked)
 
+# ---- text that already holds placeholders ------------------------------------------
+# A span over a placeholder from an earlier mask used to be dropped whole, and the rest
+# of the secret stayed readable. Now the parts around the placeholder are masked.
+ast = veil.Store(home("around"))
+old = ast.placeholder("API_KEY", FAKES["sk_proj"][1])
+alien = "{{API_KEY_%s}}" % rs(8, "0123456789abcdef")  # from another home, unknown here
+pw = ["Zq8" + rs(9) for _ in range(10)]  # one each: a value masked once is masked anywhere
+key_lines = pem_body.split("\n")
+AROUND = [  # (text, readable before, still there after)
+    (f"password: {pw[0]} horse {old}\n", [pw[0], "horse"], [" " + old]),
+    (f"password: {old} {pw[1]} horse\n", [pw[1], "horse"], [old]),
+    (f'{{"token": "{pw[2]}-{old}", "client_secret": "{old}-{pw[3]}"}}\n', [pw[2], pw[3]], [old]),
+    (f"run.sh --token {pw[4]}{old} --verbose\n", [pw[4]], [old, " --verbose"]),
+    (f"db: connect postgres://bob:{old}{pw[5]}@db:5432/app failed\nredis://:${{REDIS_PW}}@cache\n", [pw[5]],
+     [old, "@db:5432/app failed", ":${REDIS_PW}@"]),
+    (f"password: {alien} {pw[6]} horse\n{alien}: retry later\n", [pw[6], "horse"], [f"\n{alien}: retry later\n"]),
+    ("boot\nComment: " + old + "\n" + pem_body + "\n-----END RSA " + "PRIVATE KEY-----\nup\n", key_lines, [old]),
+    ("boot\n-----BEGIN RSA " + "PRIVATE KEY-----" + old + "\n" + pem_body[:150], key_lines[:2], [old]),
+]
+for text, before, after in AROUND:
+    masked, counts = veil.mask_text(text, ast)
+    check(f"around a placeholder: {text.strip()[:40]}", not [s for s in before if s in masked]
+          and all(s in masked for s in after) and veil.mask_text(masked, ast)[0] == masked
+          and veil.unmask_text(masked, ast.values) == veil.unmask_text(text, ast.values), masked)
+text = (f"password: {pw[8]} horse {old}\n"
+        f"secrets: {old} ... {old}\n"  # punctuation between two placeholders stays
+        f"WALLET_PK=0x{FAKES['hex'][1]}\n"  # the 0x stays, also in a mask of masked text
+        f"api_keys: [{FAKES['aws'][1]}, {pw[9]}]\n"  # a list is not a value: no part of it later either
+        f"DB_PASSWORD: correct horse {P[1]}\n"
+        f"token=correct horse {P[1]}tail9\n")  # one word under token: the rest is not its value
+masked, _ = veil.mask_text(text, ast)
+twice, counts2 = veil.mask_text(masked, ast)
+check("masked text masked again: nothing new, a value read as it was before it was masked",
+      pw[8] not in masked and f"{old} ... {old}" in masked and "WALLET_PK=0x{{HEX_KEY_" in masked
+      and twice == masked and not counts2, twice)
+
 # ---- determinism, known values, keys -----------------------------------------------
 v = "tok_" + rs(30)
 st = veil.Store(home("det"))
